@@ -1,0 +1,11 @@
+run_type = "sampling"
+device = "cuda:0"
+
+[parameters]
+model_file = "priors/libinvent.prior"
+smiles_file = "inputs/SBI-810.smi"
+output_file = "outputs/SBI-810.csv"
+
+num_smiles = 30
+unique_molecules = true
+randomize_smiles = true
