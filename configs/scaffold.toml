@@ -1,0 +1,13 @@
+run_type = "sampling"
+device = "cuda:0"
+
+[parameters]
+model_file = "priors/mol2mol_scaffold_generic.prior"
+smiles_file = "inputs/SBI-810_scaffold.smi"
+output_file = "outputs/SBI-810_scaffold.csv"
+
+num_smiles = 200
+sample_strategy = "multinomial"
+temperature = 1.0
+unique_molecules = true
+randomize_smiles = false
