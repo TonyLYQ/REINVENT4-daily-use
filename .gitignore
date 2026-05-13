@@ -21,6 +21,9 @@ mprofile_*.dat
 /reinvent/models/reinvent_core/
 /reinvent_models/
 /build/
+/inputs/
+/outputs/
+/logs/
 
 # Notebooks
 .ipynb_checkpoints/
