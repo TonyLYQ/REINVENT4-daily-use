@@ -2,11 +2,12 @@
 """Filter PubChem patent-associated molecules from a SMILES CSV.
 
 The input CSV must contain a column named ``SMILES``.  The script queries
-PubChem PUG-REST for each unique SMILES string and removes rows whose matched
-PubChem CID has ``PatentID`` cross-references.
+PubChem through PubChemPy for each unique SMILES string and removes molecules
+whose matched PubChem CID has ``PatentID`` cross-references.
 
 Usage:
     python patent_filter.py /path/to/output.csv
+    python patent_filter.py /path/to/output.csv --broad
 
 Output:
     /path/to/output_patent_filtered.csv
@@ -15,22 +16,24 @@ Note:
     PubChem PatentID cross-references indicate that a molecule appears in
     patent-associated PubChem records.  This is a conservative cheminformatics
     filter, not a legal determination of active patent protection.
+
+    With ``--broad``, the script removes every molecule that can be matched to
+    any PubChem CID, without checking PatentID cross-references.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import requests
+import pubchempy as pcp
 
 
-PUBCHEM_PUG_REST = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
-REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
 REQUEST_DELAY_SECONDS = 0.2
@@ -44,10 +47,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Read a CSV containing a SMILES column, remove molecules with PubChem "
-            "PatentID cross-references, and write *_patent_filtered.csv next to it."
+            "patent associations, and write *_patent_filtered.csv next to it."
         )
     )
     parser.add_argument("csv_path", help="Path to the input CSV file containing a SMILES column.")
+    parser.add_argument(
+        "--broad",
+        action="store_true",
+        help=(
+            "Broad filter mode: remove a row if its SMILES can be matched to any PubChem CID. "
+            "Without this flag, rows are removed only when matched CIDs have PatentID xrefs."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -66,80 +77,62 @@ def find_smiles_column(columns: list[str]) -> str:
     raise ValueError("Input CSV must contain a column named 'SMILES'.")
 
 
-def request_json(
-    session: requests.Session,
-    method: str,
-    url: str,
-    *,
-    empty_status_codes: set[int] | None = None,
-    **kwargs: Any,
-) -> dict[str, Any] | None:
+def pubchem_call_with_retries(description: str, func: Any) -> Any:
     last_error: Exception | None = None
-    empty_status_codes = empty_status_codes or set()
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = session.request(
-                method,
-                url,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-                **kwargs,
-            )
-        except requests.RequestException as exc:
+            return func()
+        except (pcp.NotFoundError, pcp.BadRequestError):
+            return None
+        except (pcp.ServerBusyError, pcp.ServerError, pcp.TimeoutError, OSError) as exc:
             last_error = exc
-        else:
-            if response.status_code in empty_status_codes:
-                return None
-
-            if response.status_code in {429, 500, 502, 503, 504}:
-                last_error = PubChemQueryError(
-                    f"PubChem temporary error {response.status_code}: {response.text[:200]}"
-                )
-            elif not response.ok:
-                raise PubChemQueryError(
-                    f"PubChem request failed with HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
-                )
-            else:
-                try:
-                    return response.json()
-                except ValueError as exc:
-                    raise PubChemQueryError(
-                        f"PubChem returned non-JSON content for {url}: {response.text[:500]}"
-                    ) from exc
+        except pcp.PubChemPyError as exc:
+            raise PubChemQueryError(f"PubChemPy failed while {description}: {exc}") from exc
 
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_DELAY_SECONDS * attempt)
 
-    raise PubChemQueryError(f"PubChem request failed after {MAX_RETRIES} attempts: {last_error}")
-
-
-def get_cids_for_smiles(session: requests.Session, smiles: str) -> list[int]:
-    payload = request_json(
-        session,
-        "POST",
-        f"{PUBCHEM_PUG_REST}/compound/smiles/cids/JSON",
-        empty_status_codes={400, 404},
-        data={"smiles": smiles},
+    raise PubChemQueryError(
+        f"PubChem request failed after {MAX_RETRIES} attempts while {description}: {last_error}"
     )
 
-    if payload is None:
-        return []
 
-    cids = payload.get("IdentifierList", {}).get("CID", [])
-    return [int(cid) for cid in cids]
-
-
-def get_patent_ids_for_cid(session: requests.Session, cid: int) -> list[str]:
-    payload = request_json(
-        session,
-        "GET",
-        f"{PUBCHEM_PUG_REST}/compound/cid/{cid}/xrefs/PatentID/JSON",
-        empty_status_codes={404},
+def get_cids_for_smiles(smiles: str) -> list[int]:
+    compounds = pubchem_call_with_retries(
+        f"looking up CIDs for SMILES {smiles!r}",
+        lambda: pcp.get_compounds(smiles, namespace="smiles"),
     )
 
-    if payload is None:
+    if not compounds:
         return []
+
+    cids: set[int] = set()
+    for compound in compounds:
+        try:
+            cid = int(compound.cid)
+        except (TypeError, ValueError):
+            continue
+
+        if cid > 0:
+            cids.add(cid)
+
+    return sorted(cids)
+
+
+def get_patent_ids_for_cid(cid: int) -> list[str]:
+    response = pubchem_call_with_retries(
+        f"looking up PatentID xrefs for CID {cid}",
+        lambda: pcp.request(cid, namespace="cid", operation="xrefs/PatentID"),
+    )
+
+    if response is None:
+        return []
+
+    try:
+        payload = json.loads(response.read().decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PubChemQueryError(f"PubChem returned invalid PatentID JSON for CID {cid}: {exc}") from exc
 
     patent_ids: set[str] = set()
     information = payload.get("InformationList", {}).get("Information", [])
@@ -155,11 +148,14 @@ def get_patent_ids_for_cid(session: requests.Session, cid: int) -> list[str]:
     return sorted(patent_ids)
 
 
-def has_pubchem_patent_reference(session: requests.Session, smiles: str) -> bool:
-    cids = get_cids_for_smiles(session, smiles)
+def should_remove_smiles(smiles: str, *, broad: bool) -> bool:
+    cids = get_cids_for_smiles(smiles)
+
+    if broad:
+        return bool(cids)
 
     for cid in cids:
-        patent_ids = get_patent_ids_for_cid(session, cid)
+        patent_ids = get_patent_ids_for_cid(cid)
         if patent_ids:
             return True
 
@@ -175,28 +171,23 @@ def normalize_smiles_value(value: Any) -> str:
     return str(value).strip()
 
 
-def build_patent_flags(smiles_values: pd.Series) -> dict[str, bool]:
+def build_patent_flags(smiles_values: pd.Series, *, broad: bool) -> dict[str, bool]:
     unique_smiles = sorted({normalize_smiles_value(value) for value in smiles_values})
     unique_smiles = [smiles for smiles in unique_smiles if smiles]
 
     patent_flags: dict[str, bool] = {"": False}
+    total = len(unique_smiles)
 
-    with requests.Session() as session:
-        session.headers.update(
-            {
-                "User-Agent": (
-                    "patent-filter/1.0 "
-                    "(PubChem PUG-REST; filters SMILES with PatentID xrefs)"
-                )
-            }
-        )
+    for index, smiles in enumerate(unique_smiles, start=1):
+        patent_flags[smiles] = should_remove_smiles(smiles, broad=broad)
 
-        total = len(unique_smiles)
-        for index, smiles in enumerate(unique_smiles, start=1):
-            patent_flags[smiles] = has_pubchem_patent_reference(session, smiles)
+        if broad:
+            status = "cid-matched" if patent_flags[smiles] else "kept"
+        else:
             status = "patent-associated" if patent_flags[smiles] else "kept"
-            print(f"[{index}/{total}] {status}: {smiles}", file=sys.stderr)
-            time.sleep(REQUEST_DELAY_SECONDS)
+
+        print(f"[{index}/{total}] {status}: {smiles}", file=sys.stderr)
+        time.sleep(REQUEST_DELAY_SECONDS)
 
     return patent_flags
 
@@ -216,7 +207,7 @@ def main() -> int:
     try:
         data = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
         smiles_column = find_smiles_column(list(data.columns))
-        patent_flags = build_patent_flags(data[smiles_column])
+        patent_flags = build_patent_flags(data[smiles_column], broad=args.broad)
     except (OSError, ValueError, PubChemQueryError, pd.errors.ParserError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -229,7 +220,10 @@ def main() -> int:
     filtered_data.to_csv(output_path, index=False)
 
     print(f"Input rows: {len(data)}", file=sys.stderr)
-    print(f"Removed patent-associated rows: {int(patented_mask.sum())}", file=sys.stderr)
+    if args.broad:
+        print(f"Removed CID-matched rows: {int(patented_mask.sum())}", file=sys.stderr)
+    else:
+        print(f"Removed patent-associated rows: {int(patented_mask.sum())}", file=sys.stderr)
     print(f"Output rows: {len(filtered_data)}", file=sys.stderr)
     print(f"Wrote: {output_path}", file=sys.stderr)
 
